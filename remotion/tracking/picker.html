@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Marcar areolas</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; background: #14161b; color: #eee; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  button { padding: 6px 12px; border-radius: 6px; border: 0; background: #2d3340; color: #fff; cursor: pointer; }
+  button:hover { background: #3b4352; }
+  button.primary { background: #2563eb; }
+  button.warn { background: #b45309; }
+  #stage { position: relative; display: inline-block; background: #000; }
+  video { display: block; max-height: 70vh; max-width: 100%; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+  input[type=range] { width: min(700px, 90vw); }
+  textarea { width: min(900px, 95vw); height: 90px; background: #0d0f13; color: #9fe; border: 1px solid #333; padding: 8px; }
+  ul { padding-left: 18px; }
+  small { color: #aab; }
+</style>
+</head>
+<body>
+<h1>Marcar areolas</h1>
+<small>1) Escolha o vídeo. 2) Vá ao frame desejado. 3) Arraste o mouse sobre cada areola. 4) Clique em "Marcar aqui".</small>
+
+<div class="row">
+  <label>Vídeo: <input type="file" id="file" accept="video/*"></label>
+  <label>Conferir tracking.json: <input type="file" id="trk" accept=".json"></label>
+</div>
+
+<div id="stage">
+  <video id="v" muted playsinline></video>
+  <canvas id="c"></canvas>
+</div>
+
+<div class="row">
+  <input type="range" id="seek" min="0" max="1000" value="0">
+  <span id="time">0.000 s</span>
+</div>
+<div class="row">
+  <button id="play">▶ / ⏸</button>
+  <button id="b10">⏪ 1 s</button>
+  <button id="b1">◀ 1 frame</button>
+  <button id="f1">1 frame ▶</button>
+  <button id="f10">1 s ⏩</button>
+  <label>fps: <input id="fps" type="number" value="30" step="0.01" style="width:70px"></label>
+</div>
+
+<div class="row">
+  <button class="primary" id="mark">Marcar aqui (com os retângulos desenhados)</button>
+  <button class="warn" id="none">Sem areola a partir daqui</button>
+  <button id="undo">Desfazer último retângulo</button>
+  <button id="clear">Limpar retângulos</button>
+</div>
+
+<b>Pontos marcados</b>
+<ul id="list"></ul>
+
+<div class="row"><button class="primary" id="gen">Gerar comando</button></div>
+<textarea id="out" readonly placeholder="O comando para colar no PowerShell aparece aqui"></textarea>
+<div class="row"><button id="copy">Copiar comando</button></div>
+<small>Dica: marque um ponto sempre que o círculo escapar, e um "Sem areola" quando ela sair de quadro. Depois carregue o tracking.json acima para conferir o resultado.</small>
+
+<script>
+const $ = id => document.getElementById(id);
+const v = $('v'), c = $('c'), ctx = c.getContext('2d');
+let boxes = [];           // retângulos em pixels do vídeo [x,y,w,h]
+let marks = [];           // {t, rois}
+let drag = null;
+let tracking = null;      // tracking.json carregado
+
+const fps = () => parseFloat($('fps').value) || 30;
+const fmt = t => t.toFixed(3);
+
+$('file').onchange = e => {
+  const f = e.target.files[0];
+  if (f) { v.src = URL.createObjectURL(f); v.load(); }
+};
+$('trk').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  tracking = JSON.parse(await f.text());
+  $('fps').value = tracking.fps;
+  draw();
+};
+v.onloadedmetadata = () => {
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  $('seek').max = Math.floor(v.duration * 1000);
+  draw();
+};
+v.ontimeupdate = v.onseeked = () => {
+  $('seek').value = Math.floor(v.currentTime * 1000);
+  $('time').textContent = fmt(v.currentTime) + ' s  (frame ' + Math.round(v.currentTime * fps()) + ')';
+  draw();
+};
+$('seek').oninput = e => { v.currentTime = e.target.value / 1000; };
+const step = dt => { v.pause(); v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + dt)); };
+$('b1').onclick = () => step(-1 / fps());
+$('f1').onclick = () => step(1 / fps());
+$('b10').onclick = () => step(-1);
+$('f10').onclick = () => step(1);
+$('play').onclick = () => (v.paused ? v.play() : v.pause());
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.target.type !== 'range') return;
+  if (e.key === 'ArrowLeft') step(-1 / fps());
+  if (e.key === 'ArrowRight') step(1 / fps());
+  if (e.key === ' ') { e.preventDefault(); v.paused ? v.play() : v.pause(); }
+});
+
+function pos(e) {
+  const r = c.getBoundingClientRect();
+  return [(e.clientX - r.left) * c.width / r.width, (e.clientY - r.top) * c.height / r.height];
+}
+c.onmousedown = e => { v.pause(); drag = { a: pos(e), b: pos(e) }; };
+c.onmousemove = e => { if (drag) { drag.b = pos(e); draw(); } };
+window.onmouseup = () => {
+  if (!drag) return;
+  const [x1, y1] = drag.a, [x2, y2] = drag.b;
+  const w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
+  if (w > 4 && h > 4) boxes.push([Math.round(Math.min(x1, x2)), Math.round(Math.min(y1, y2)), Math.round(w), Math.round(h)]);
+  drag = null; draw();
+};
+
+function draw() {
+  ctx.clearRect(0, 0, c.width, c.height);
+  const lw = Math.max(2, c.width / 300);
+  ctx.lineWidth = lw;
+  ctx.strokeStyle = '#22ff66';
+  boxes.forEach(b => ctx.strokeRect(...b));
+  if (drag) {
+    ctx.strokeStyle = '#ffee00';
+    ctx.strokeRect(Math.min(drag.a[0], drag.b[0]), Math.min(drag.a[1], drag.b[1]),
+      Math.abs(drag.b[0] - drag.a[0]), Math.abs(drag.b[1] - drag.a[1]));
+  }
+  if (tracking) {
+    const f = Math.min(Math.round(v.currentTime * tracking.fps), tracking.tracks.length - 1);
+    ctx.fillStyle = '#050d2e';
+    (tracking.tracks[f] || []).forEach(([x, y, r]) => {
+      const pad = 6 * c.width / 1080;
+      ctx.beginPath(); ctx.arc(x, y, r + pad, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+}
+
+$('undo').onclick = () => { boxes.pop(); draw(); };
+$('clear').onclick = () => { boxes = []; draw(); };
+
+function addMark(rois) {
+  const t = Math.round(v.currentTime * 1000) / 1000;
+  marks = marks.filter(m => m.t !== t);
+  marks.push({ t, rois });
+  marks.sort((a, b) => a.t - b.t);
+  boxes = [];
+  render(); draw();
+}
+$('mark').onclick = () => {
+  if (!boxes.length) { alert('Desenhe pelo menos um retângulo sobre a areola (arraste com o mouse).'); return; }
+  addMark(boxes.slice());
+};
+$('none').onclick = () => addMark([]);
+
+function render() {
+  $('list').innerHTML = '';
+  marks.forEach((m, i) => {
+    const li = document.createElement('li');
+    li.textContent = fmt(m.t) + ' s: ' + (m.rois.length ? m.rois.length + ' areola(s)' : 'sem areola') + ' ';
+    const go = document.createElement('button'); go.textContent = 'ir'; go.onclick = () => { v.currentTime = m.t; };
+    const del = document.createElement('button'); del.textContent = 'apagar';
+    del.onclick = () => { marks.splice(i, 1); render(); };
+    li.append(go, ' ', del);
+    $('list').append(li);
+  });
+}
+
+$('gen').onclick = () => {
+  if (!marks.length) { alert('Marque pelo menos um ponto.'); return; }
+  const plan = marks.map(m => fmt(m.t) + '@' + m.rois.map(b => b.join(',')).join(';')).join('|');
+  const name = ($('file').files[0] || { name: '07out_Reels.mp4' }).name;
+  $('out').value = 'python tracking/track.py public/' + name + ' --plan "' + plan + '"';
+};
+$('copy').onclick = () => { $('out').select(); document.execCommand('copy'); };
+</script>
+</body>
+</html>

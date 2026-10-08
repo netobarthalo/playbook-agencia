@@ -125,6 +125,65 @@ def smooth_runs(series, window):
     return out
 
 
+def finish(args, rows, lost_frames, fps, width, height):
+    series = []
+    for f in rows:
+        series.append([[b[0] + b[2] / 2, b[1] + b[3] / 2,
+                        max(b[2], b[3]) * args.scale / 2] for b in f])
+    series = smooth_runs(series, args.smooth)
+    tracks = [[[round(float(v), 1) for v in p] for p in f] for f in series]
+
+    with open(args.out, "w") as fh:
+        json.dump({"fps": fps, "width": width, "height": height,
+                   "frames": len(tracks), "tracks": tracks}, fh)
+    print(f"OK: {len(tracks)} frames -> {args.out}")
+    if lost_frames:
+        print(f"ATENÇÃO: rastreio perdido em {len(lost_frames)} frames "
+              f"(ex.: {lost_frames[:10]}). Confira esses trechos no Studio.")
+
+
+def parse_plan(text, fps):
+    """'4.2@x,y,w,h;x,y,w,h|9.8@|11.5@x,y,w,h' -> {frame: [rois]}"""
+    kf = {}
+    for part in text.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        t, _, boxes = part.partition("@")
+        rois = [tuple(int(float(v)) for v in b.split(","))
+                for b in boxes.split(";") if b.strip()]
+        kf[int(round(float(t) * fps))] = rois
+    return kf
+
+
+def run_plan(cap, kf):
+    """Rastreia sem janelas: reinicia os rastreadores em cada ponto do plano."""
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    rows, lost_frames = [], []
+    trackers, boxes = [], []
+    idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if idx in kf:
+            boxes = [list(r) for r in kf[idx]]
+            trackers = init_trackers(frame, kf[idx])
+        else:
+            lost = False
+            for i, t in enumerate(trackers):
+                good, box = t.update(frame)
+                if good:
+                    boxes[i] = [int(v) for v in box]
+                else:
+                    lost = True
+            if lost:
+                lost_frames.append(idx)
+        rows.append([b[:] for b in boxes])
+        idx += 1
+    return rows, lost_frames
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("video")
@@ -136,6 +195,8 @@ def main():
                     help="diâmetro do círculo = lado maior da caixa * scale")
     ap.add_argument("--smooth", type=int, default=5)
     ap.add_argument("--no-preview", action="store_true")
+    ap.add_argument("--plan",
+                    help="plano gerado pelo picker.html (sem janelas do OpenCV)")
     ap.add_argument("--export-frame", type=int,
                     help="salva esse frame em frame.png (para ler as coordenadas "
                          "no Paint) e sai")
@@ -148,6 +209,11 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if args.plan:
+        rows, lost_frames = run_plan(cap, parse_plan(args.plan, fps))
+        finish(args, rows, lost_frames, fps, width, height)
+        return
 
     if args.export_frame is not None:
         cap.set(cv2.CAP_PROP_POS_FRAMES, args.export_frame)
@@ -217,20 +283,7 @@ def main():
                 boxes = [list(r) for r in new]
                 rows[-1] = [b[:] for b in boxes]
 
-    series = []
-    for f in rows:
-        series.append([[b[0] + b[2] / 2, b[1] + b[3] / 2,
-                        max(b[2], b[3]) * args.scale / 2] for b in f])
-    series = smooth_runs(series, args.smooth)
-    tracks = [[[round(float(v), 1) for v in p] for p in f] for f in series]
-
-    with open(args.out, "w") as fh:
-        json.dump({"fps": fps, "width": width, "height": height,
-                   "frames": len(tracks), "tracks": tracks}, fh)
-    print(f"OK: {len(tracks)} frames (círculos a partir do frame {start}) -> {args.out}")
-    if lost_frames:
-        print(f"ATENÇÃO: rastreio perdido em {len(lost_frames)} frames "
-              f"(ex.: {lost_frames[:10]}). Confira esses trechos no Studio.")
+    finish(args, rows, lost_frames, fps, width, height)
 
 
 if __name__ == "__main__":
