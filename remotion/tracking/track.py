@@ -21,6 +21,18 @@ import cv2
 import numpy as np
 
 
+MAX_VIEW_H = 800  # altura máxima das janelas (cabe em telas pequenas)
+
+
+def fit(img):
+    """Reduz a imagem para caber na tela; devolve (imagem, fator)."""
+    h = img.shape[0]
+    if h <= MAX_VIEW_H:
+        return img, 1.0
+    k = MAX_VIEW_H / h
+    return cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA), k
+
+
 def make_tracker():
     if hasattr(cv2, "TrackerCSRT_create"):
         return cv2.TrackerCSRT_create()
@@ -38,9 +50,9 @@ def pick_start_frame(cap, total):
             view = fr.copy()
             cv2.putText(view, f"frame {pos}/{total - 1}  (ENTER = usar este)",
                         (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-            cv2.imshow("Escolha o frame em que a areola aparece", view)
+            cv2.imshow("Escolha o frame em que a areola aparece", fit(view)[0])
 
-    cv2.namedWindow("Escolha o frame em que a areola aparece", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Escolha o frame em que a areola aparece", cv2.WINDOW_AUTOSIZE)
     cv2.createTrackbar("frame", "Escolha o frame em que a areola aparece", 0,
                        max(total - 1, 1), show)
     show(0)
@@ -62,12 +74,15 @@ def pick_start_frame(cap, total):
 
 def select_rois(frame, title):
     rois = []
-    img = frame.copy()
+    img, k = fit(frame.copy())
+    print("Clique e ARRASTE com o botão esquerdo sobre a areola; "
+          "depois ENTER (ou ESPAÇO). ESC = terminar.")
     while True:
-        box = cv2.selectROI(f"{title} (ENTER=ok, ESC=terminar)", img, False)
+        box = cv2.selectROI(f"{title} (arraste, depois ENTER; ESC=terminar)",
+                            img, False)
         if box[2] == 0 or box[3] == 0:
             break
-        rois.append(tuple(int(v) for v in box))
+        rois.append(tuple(int(round(v / k)) for v in box))
         cv2.rectangle(img, (box[0], box[1]),
                       (box[0] + box[2], box[1] + box[3]), (0, 255, 0), 2)
     cv2.destroyAllWindows()
@@ -121,6 +136,9 @@ def main():
                     help="diâmetro do círculo = lado maior da caixa * scale")
     ap.add_argument("--smooth", type=int, default=5)
     ap.add_argument("--no-preview", action="store_true")
+    ap.add_argument("--export-frame", type=int,
+                    help="salva esse frame em frame.png (para ler as coordenadas "
+                         "no Paint) e sai")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -130,6 +148,14 @@ def main():
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if args.export_frame is not None:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, args.export_frame)
+        ok, fr = cap.read()
+        if not ok:
+            sys.exit("Frame inválido")
+        cv2.imwrite("frame.png", fr)
+        sys.exit(f"Salvo frame.png ({width}x{height}).")
 
     start = args.start_frame
     if start is None:
@@ -180,7 +206,7 @@ def main():
             elif not trackers:
                 cv2.putText(view, "SEM CIRCULO - ESPACO quando a areola voltar",
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            cv2.imshow("Rastreio (ESPACO=reselecionar/ocultar, q=sair)", view)
+            cv2.imshow("Rastreio (ESPACO=reselecionar/ocultar, q=sair)", fit(view)[0])
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 sys.exit("Cancelado")
